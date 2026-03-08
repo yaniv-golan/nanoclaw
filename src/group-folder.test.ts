@@ -22,9 +22,9 @@ describe('group folder validation', () => {
     expect(isValidGroupFolder('')).toBe(false);
   });
 
-  it('resolves safe paths under groups directory', () => {
+  it('resolves safe paths under users directory', () => {
     const resolved = resolveGroupFolderPath('family-chat');
-    expect(resolved.endsWith(`${path.sep}groups${path.sep}family-chat`)).toBe(
+    expect(resolved.endsWith(`${path.sep}users${path.sep}family-chat`)).toBe(
       true,
     );
   });

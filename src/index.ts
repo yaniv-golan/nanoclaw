@@ -2,6 +2,7 @@ import fs from 'fs';
 import path from 'path';
 
 import {
+  ADMIN_USER_ID,
   ASSISTANT_NAME,
   IDLE_TIMEOUT,
   POLL_INTERVAL,
@@ -24,14 +25,20 @@ import {
   ensureContainerRuntimeRunning,
 } from './container-runtime.js';
 import {
+  addUserChannel,
+  createUser,
   getAllChats,
   getAllRegisteredGroups,
   getAllSessions,
   getAllTasks,
+  getAllUserChannels,
+  getAllUsers,
   getMessagesSince,
   getNewMessages,
+  getNewMessagesMultiJid,
   getRegisteredGroup,
   getRouterState,
+  getUserByJid,
   initDatabase,
   setRegisteredGroup,
   setRouterState,
@@ -40,7 +47,7 @@ import {
   storeMessage,
 } from './db.js';
 import { GroupQueue } from './group-queue.js';
-import { resolveGroupFolderPath } from './group-folder.js';
+import { resolveUserFolderPath } from './user-folder.js';
 import { startIpcWatcher } from './ipc.js';
 import { findChannel, formatMessages, formatOutbound } from './router.js';
 import {
@@ -50,7 +57,7 @@ import {
   shouldDropMessage,
 } from './sender-allowlist.js';
 import { startSchedulerLoop } from './task-scheduler.js';
-import { Channel, NewMessage, RegisteredGroup } from './types.js';
+import { Channel, NewMessage, RegisteredGroup, User, UserChannel } from './types.js';
 import { logger } from './logger.js';
 
 // Re-export for backwards compatibility during refactor
@@ -59,11 +66,51 @@ export { escapeXml, formatMessages } from './router.js';
 let lastTimestamp = '';
 let sessions: Record<string, string> = {};
 let registeredGroups: Record<string, RegisteredGroup> = {};
+let users: Record<string, User> = {};
+let userChannels: UserChannel[] = [];
 let lastAgentTimestamp: Record<string, string> = {};
 let messageLoopRunning = false;
 
 const channels: Channel[] = [];
 const queue = new GroupQueue();
+
+/**
+ * Resolve the userId for a JID.
+ * Uses user_channels table first, falls back to registered_groups.
+ */
+function resolveUserId(chatJid: string): string | undefined {
+  // Check user_channels first
+  const uc = userChannels.find((c) => c.jid === chatJid);
+  if (uc) return uc.user_id;
+  // Fallback: registered_groups
+  const group = registeredGroups[chatJid];
+  return group?.folder;
+}
+
+/**
+ * Resolve the User for a JID.
+ */
+function resolveUser(chatJid: string): User | undefined {
+  const userId = resolveUserId(chatJid);
+  if (!userId) return undefined;
+  return users[userId];
+}
+
+/**
+ * Get all JIDs belonging to a user.
+ */
+function getUserJids(userId: string): string[] {
+  const jids = userChannels
+    .filter((c) => c.user_id === userId)
+    .map((c) => c.jid);
+  // Also include any registered_groups JIDs that map to this user
+  for (const [jid, group] of Object.entries(registeredGroups)) {
+    if (group.folder === userId && !jids.includes(jid)) {
+      jids.push(jid);
+    }
+  }
+  return jids;
+}
 
 function loadState(): void {
   lastTimestamp = getRouterState('last_timestamp') || '';
@@ -76,8 +123,14 @@ function loadState(): void {
   }
   sessions = getAllSessions();
   registeredGroups = getAllRegisteredGroups();
+  users = getAllUsers();
+  userChannels = getAllUserChannels();
   logger.info(
-    { groupCount: Object.keys(registeredGroups).length },
+    {
+      groupCount: Object.keys(registeredGroups).length,
+      userCount: Object.keys(users).length,
+      channelCount: userChannels.length,
+    },
     'State loaded',
   );
 }
@@ -90,7 +143,7 @@ function saveState(): void {
 function registerGroup(jid: string, group: RegisteredGroup): void {
   let groupDir: string;
   try {
-    groupDir = resolveGroupFolderPath(group.folder);
+    groupDir = resolveUserFolderPath(group.folder);
   } catch (err) {
     logger.warn(
       { jid, folder: group.folder, err },
@@ -104,6 +157,37 @@ function registerGroup(jid: string, group: RegisteredGroup): void {
 
   // Create group folder
   fs.mkdirSync(path.join(groupDir, 'logs'), { recursive: true });
+
+  // Auto-create user and channel mapping if not already present
+  const userId = group.folder;
+  if (!users[userId]) {
+    const isAdmin = group.isMain === true || userId === ADMIN_USER_ID;
+    const user: User = {
+      id: userId,
+      display_name: group.name,
+      is_admin: isAdmin,
+      containerConfig: group.containerConfig,
+      created_at: new Date().toISOString(),
+    };
+    createUser(user);
+    users[userId] = user;
+  }
+
+  // Detect channel from JID
+  let channelName = 'whatsapp';
+  if (jid.startsWith('tg:')) channelName = 'telegram';
+  else if (jid.startsWith('dc:')) channelName = 'discord';
+
+  if (!userChannels.find((c) => c.jid === jid)) {
+    const uc: UserChannel = {
+      user_id: userId,
+      jid,
+      channel: channelName,
+      added_at: new Date().toISOString(),
+    };
+    addUserChannel(uc);
+    userChannels.push(uc);
+  }
 
   logger.info(
     { jid, name: group.name, folder: group.folder },
@@ -136,6 +220,13 @@ export function _setRegisteredGroups(
   registeredGroups = groups;
 }
 
+/** @internal - exported for testing */
+export function _setUserChannels(
+  channels: UserChannel[],
+): void {
+  userChannels = channels;
+}
+
 /**
  * Process all pending messages for a group.
  * Called by the GroupQueue when it's this group's turn.
@@ -144,25 +235,47 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
   const group = registeredGroups[chatJid];
   if (!group) return true;
 
+  const userId = resolveUserId(chatJid) || group.folder;
+  const user = resolveUser(chatJid);
+  const isAdmin = user?.is_admin ?? group.isMain === true;
+
   const channel = findChannel(channels, chatJid);
   if (!channel) {
     logger.warn({ chatJid }, 'No channel owns JID, skipping messages');
     return true;
   }
 
-  const isMainGroup = group.isMain === true;
-
+  // Aggregate messages from ALL JIDs belonging to this user
+  const allUserJids = getUserJids(userId);
   const sinceTimestamp = lastAgentTimestamp[chatJid] || '';
-  const missedMessages = getMessagesSince(
-    chatJid,
-    sinceTimestamp,
-    ASSISTANT_NAME,
-  );
+
+  let missedMessages: NewMessage[];
+  if (allUserJids.length > 1) {
+    // Multi-channel user: get messages from all their JIDs
+    const oldestCursor = allUserJids.reduce(
+      (oldest, jid) => {
+        const ts = lastAgentTimestamp[jid] || '';
+        return ts < oldest ? ts : oldest;
+      },
+      sinceTimestamp,
+    );
+    missedMessages = getNewMessagesMultiJid(
+      allUserJids,
+      oldestCursor,
+      ASSISTANT_NAME,
+    );
+  } else {
+    missedMessages = getMessagesSince(
+      chatJid,
+      sinceTimestamp,
+      ASSISTANT_NAME,
+    );
+  }
 
   if (missedMessages.length === 0) return true;
 
-  // For non-main groups, check if trigger is required and present
-  if (!isMainGroup && group.requiresTrigger !== false) {
+  // For non-admin groups, check if trigger is required and present
+  if (!isAdmin && group.requiresTrigger !== false) {
     const allowlistCfg = loadSenderAllowlist();
     const hasTrigger = missedMessages.some(
       (m) =>
@@ -174,15 +287,17 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
 
   const prompt = formatMessages(missedMessages, TIMEZONE);
 
-  // Advance cursor so the piping path in startMessageLoop won't re-fetch
-  // these messages. Save the old cursor so we can roll back on error.
-  const previousCursor = lastAgentTimestamp[chatJid] || '';
-  lastAgentTimestamp[chatJid] =
-    missedMessages[missedMessages.length - 1].timestamp;
+  // Advance cursor for all user's JIDs
+  const previousCursors: Record<string, string> = {};
+  const latestTimestamp = missedMessages[missedMessages.length - 1].timestamp;
+  for (const jid of allUserJids) {
+    previousCursors[jid] = lastAgentTimestamp[jid] || '';
+    lastAgentTimestamp[jid] = latestTimestamp;
+  }
   saveState();
 
   logger.info(
-    { group: group.name, messageCount: missedMessages.length },
+    { group: group.name, userId, messageCount: missedMessages.length },
     'Processing messages',
   );
 
@@ -229,7 +344,7 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
     if (result.status === 'error') {
       hadError = true;
     }
-  });
+  }, userId, isAdmin);
 
   await channel.setTyping?.(chatJid, false);
   if (idleTimer) clearTimeout(idleTimer);
@@ -244,8 +359,10 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
       );
       return true;
     }
-    // Roll back cursor so retries can re-process these messages
-    lastAgentTimestamp[chatJid] = previousCursor;
+    // Roll back cursors so retries can re-process these messages
+    for (const [jid, prev] of Object.entries(previousCursors)) {
+      lastAgentTimestamp[jid] = prev;
+    }
     saveState();
     logger.warn(
       { group: group.name },
@@ -262,18 +379,22 @@ async function runAgent(
   prompt: string,
   chatJid: string,
   onOutput?: (output: ContainerOutput) => Promise<void>,
+  userId?: string,
+  isAdmin?: boolean,
 ): Promise<'success' | 'error'> {
-  const isMain = group.isMain === true;
-  const sessionId = sessions[group.folder];
+  const effectiveUserId = userId || group.folder;
+  const effectiveIsAdmin = isAdmin ?? group.isMain === true;
+  const sessionId = sessions[effectiveUserId];
 
-  // Update tasks snapshot for container to read (filtered by group)
+  // Update tasks snapshot for container to read (filtered by user)
   const tasks = getAllTasks();
   writeTasksSnapshot(
-    group.folder,
-    isMain,
+    effectiveUserId,
+    effectiveIsAdmin,
     tasks.map((t) => ({
       id: t.id,
       groupFolder: t.group_folder,
+      userId: t.user_id,
       prompt: t.prompt,
       schedule_type: t.schedule_type,
       schedule_value: t.schedule_value,
@@ -282,11 +403,11 @@ async function runAgent(
     })),
   );
 
-  // Update available groups snapshot (main group only can see all groups)
+  // Update available groups snapshot (admin only can see all groups)
   const availableGroups = getAvailableGroups();
   writeGroupsSnapshot(
-    group.folder,
-    isMain,
+    effectiveUserId,
+    effectiveIsAdmin,
     availableGroups,
     new Set(Object.keys(registeredGroups)),
   );
@@ -295,8 +416,8 @@ async function runAgent(
   const wrappedOnOutput = onOutput
     ? async (output: ContainerOutput) => {
         if (output.newSessionId) {
-          sessions[group.folder] = output.newSessionId;
-          setSession(group.folder, output.newSessionId);
+          sessions[effectiveUserId] = output.newSessionId;
+          setSession(effectiveUserId, output.newSessionId);
         }
         await onOutput(output);
       }
@@ -308,19 +429,21 @@ async function runAgent(
       {
         prompt,
         sessionId,
-        groupFolder: group.folder,
+        groupFolder: effectiveUserId,
+        userId: effectiveUserId,
         chatJid,
-        isMain,
+        isMain: effectiveIsAdmin,
+        isAdmin: effectiveIsAdmin,
         assistantName: ASSISTANT_NAME,
       },
       (proc, containerName) =>
-        queue.registerProcess(chatJid, proc, containerName, group.folder),
+        queue.registerProcess(chatJid, proc, containerName, effectiveUserId),
       wrappedOnOutput,
     );
 
     if (output.newSessionId) {
-      sessions[group.folder] = output.newSessionId;
-      setSession(group.folder, output.newSessionId);
+      sessions[effectiveUserId] = output.newSessionId;
+      setSession(effectiveUserId, output.newSessionId);
     }
 
     if (output.status === 'error') {
@@ -444,6 +567,7 @@ async function startMessageLoop(): Promise<void> {
  * Handles crash between advancing lastTimestamp and processing messages.
  */
 function recoverPendingMessages(): void {
+  // Recover per-JID — the queue deduplicates by userId internally
   for (const [chatJid, group] of Object.entries(registeredGroups)) {
     const sinceTimestamp = lastAgentTimestamp[chatJid] || '';
     const pending = getMessagesSince(chatJid, sinceTimestamp, ASSISTANT_NAME);
@@ -565,6 +689,14 @@ async function main(): Promise<void> {
     getAvailableGroups,
     writeGroupsSnapshot: (gf, im, ag, rj) =>
       writeGroupsSnapshot(gf, im, ag, rj),
+    createUser: (user: User) => {
+      createUser(user);
+      users[user.id] = user;
+    },
+    addUserChannel: (uc: UserChannel) => {
+      addUserChannel(uc);
+      userChannels.push(uc);
+    },
   });
   queue.setProcessMessagesFn(processGroupMessages);
   recoverPendingMessages();

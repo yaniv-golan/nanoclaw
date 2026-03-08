@@ -56,6 +56,7 @@ export interface NewMessage {
 export interface ScheduledTask {
   id: string;
   group_folder: string;
+  user_id?: string;
   chat_jid: string;
   prompt: string;
   schedule_type: 'cron' | 'interval' | 'once';
@@ -66,6 +67,23 @@ export interface ScheduledTask {
   last_result: string | null;
   status: 'active' | 'paused' | 'completed';
   created_at: string;
+}
+
+// --- User entity (decouples identity from channel JIDs) ---
+
+export interface User {
+  id: string;
+  display_name: string;
+  is_admin: boolean;
+  containerConfig?: ContainerConfig;
+  created_at: string;
+}
+
+export interface UserChannel {
+  user_id: string;
+  jid: string;
+  channel: string;
+  added_at: string;
 }
 
 export interface TaskRunLog {

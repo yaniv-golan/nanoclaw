@@ -168,7 +168,8 @@ server.tool(
 
       const tasks = isMain
         ? allTasks
-        : allTasks.filter((t: { groupFolder: string }) => t.groupFolder === groupFolder);
+        : allTasks.filter((t: { groupFolder: string; userId?: string }) =>
+            (t.userId || t.groupFolder) === groupFolder);
 
       if (tasks.length === 0) {
         return { content: [{ type: 'text' as const, text: 'No scheduled tasks found.' }] };

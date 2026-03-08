@@ -6,7 +6,7 @@ import { readEnvFile } from './env.js';
 // Read config values from .env (falls back to process.env).
 // Secrets are NOT read here — they stay on disk and are loaded only
 // where needed (container-runner.ts) to avoid leaking to child processes.
-const envConfig = readEnvFile(['ASSISTANT_NAME', 'ASSISTANT_HAS_OWN_NUMBER']);
+const envConfig = readEnvFile(['ASSISTANT_NAME', 'ASSISTANT_HAS_OWN_NUMBER', 'ADMIN_USER_ID']);
 
 export const ASSISTANT_NAME =
   process.env.ASSISTANT_NAME || envConfig.ASSISTANT_NAME || 'Andy';
@@ -35,7 +35,13 @@ export const SENDER_ALLOWLIST_PATH = path.join(
 );
 export const STORE_DIR = path.resolve(PROJECT_ROOT, 'store');
 export const GROUPS_DIR = path.resolve(PROJECT_ROOT, 'groups');
+export const USERS_DIR = path.resolve(PROJECT_ROOT, 'users');
 export const DATA_DIR = path.resolve(PROJECT_ROOT, 'data');
+
+// The admin user ID — controls which user gets elevated privileges
+// (project read-only mount, register_group, cross-user IPC, etc.)
+export const ADMIN_USER_ID =
+  process.env.ADMIN_USER_ID || envConfig.ADMIN_USER_ID || 'main';
 
 export const CONTAINER_IMAGE =
   process.env.CONTAINER_IMAGE || 'nanoclaw-agent:latest';

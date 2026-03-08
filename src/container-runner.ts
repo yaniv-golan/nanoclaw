@@ -14,9 +14,15 @@ import {
   GROUPS_DIR,
   IDLE_TIMEOUT,
   TIMEZONE,
+  USERS_DIR,
 } from './config.js';
 import { readEnvFile } from './env.js';
-import { resolveGroupFolderPath, resolveGroupIpcPath } from './group-folder.js';
+import {
+  resolveUserFolderPath,
+  resolveUserIpcPath,
+  resolveGroupFolderPath,
+  resolveGroupIpcPath,
+} from './user-folder.js';
 import { logger } from './logger.js';
 import {
   CONTAINER_RUNTIME_BIN,
@@ -34,8 +40,10 @@ export interface ContainerInput {
   prompt: string;
   sessionId?: string;
   groupFolder: string;
+  userId?: string;
   chatJid: string;
   isMain: boolean;
+  isAdmin?: boolean;
   isScheduledTask?: boolean;
   assistantName?: string;
   secrets?: Record<string, string>;
@@ -57,10 +65,12 @@ interface VolumeMount {
 function buildVolumeMounts(
   group: RegisteredGroup,
   isMain: boolean,
+  userId?: string,
 ): VolumeMount[] {
   const mounts: VolumeMount[] = [];
   const projectRoot = process.cwd();
-  const groupDir = resolveGroupFolderPath(group.folder);
+  const effectiveId = userId || group.folder;
+  const groupDir = resolveUserFolderPath(effectiveId);
 
   if (isMain) {
     // Main gets the project root read-only. Writable paths the agent needs
@@ -111,12 +121,12 @@ function buildVolumeMounts(
     }
   }
 
-  // Per-group Claude sessions directory (isolated from other groups)
-  // Each group gets their own .claude/ to prevent cross-group session access
+  // Per-user Claude sessions directory (isolated from other users)
+  // Each user gets their own .claude/ to prevent cross-user session access
   const groupSessionsDir = path.join(
     DATA_DIR,
     'sessions',
-    group.folder,
+    effectiveId,
     '.claude',
   );
   fs.mkdirSync(groupSessionsDir, { recursive: true });
@@ -144,12 +154,23 @@ function buildVolumeMounts(
     );
   }
 
-  // Sync skills from container/skills/ into each group's .claude/skills/
+  // Sync shared skills from container/skills/ into .claude/skills/
   const skillsSrc = path.join(process.cwd(), 'container', 'skills');
   const skillsDst = path.join(groupSessionsDir, 'skills');
   if (fs.existsSync(skillsSrc)) {
     for (const skillDir of fs.readdirSync(skillsSrc)) {
       const srcDir = path.join(skillsSrc, skillDir);
+      if (!fs.statSync(srcDir).isDirectory()) continue;
+      const dstDir = path.join(skillsDst, skillDir);
+      fs.cpSync(srcDir, dstDir, { recursive: true });
+    }
+  }
+
+  // Sync personal skills from users/{id}/skills/ into .claude/skills/
+  const personalSkillsSrc = path.join(USERS_DIR, effectiveId, 'skills');
+  if (fs.existsSync(personalSkillsSrc)) {
+    for (const skillDir of fs.readdirSync(personalSkillsSrc)) {
+      const srcDir = path.join(personalSkillsSrc, skillDir);
       if (!fs.statSync(srcDir).isDirectory()) continue;
       const dstDir = path.join(skillsDst, skillDir);
       fs.cpSync(srcDir, dstDir, { recursive: true });
@@ -161,9 +182,9 @@ function buildVolumeMounts(
     readonly: false,
   });
 
-  // Per-group IPC namespace: each group gets its own IPC directory
-  // This prevents cross-group privilege escalation via IPC
-  const groupIpcDir = resolveGroupIpcPath(group.folder);
+  // Per-user IPC namespace: each user gets their own IPC directory
+  // This prevents cross-user privilege escalation via IPC
+  const groupIpcDir = resolveUserIpcPath(effectiveId);
   fs.mkdirSync(path.join(groupIpcDir, 'messages'), { recursive: true });
   fs.mkdirSync(path.join(groupIpcDir, 'tasks'), { recursive: true });
   fs.mkdirSync(path.join(groupIpcDir, 'input'), { recursive: true });
@@ -185,7 +206,7 @@ function buildVolumeMounts(
   const groupAgentRunnerDir = path.join(
     DATA_DIR,
     'sessions',
-    group.folder,
+    effectiveId,
     'agent-runner-src',
   );
   if (!fs.existsSync(groupAgentRunnerDir) && fs.existsSync(agentRunnerSrc)) {
@@ -263,10 +284,12 @@ export async function runContainerAgent(
 ): Promise<ContainerOutput> {
   const startTime = Date.now();
 
-  const groupDir = resolveGroupFolderPath(group.folder);
+  const effectiveId = input.userId || group.folder;
+  const groupDir = resolveUserFolderPath(effectiveId);
   fs.mkdirSync(groupDir, { recursive: true });
 
-  const mounts = buildVolumeMounts(group, input.isMain);
+  const isAdmin = input.isAdmin ?? input.isMain;
+  const mounts = buildVolumeMounts(group, isAdmin, input.userId);
   const safeName = group.folder.replace(/[^a-zA-Z0-9-]/g, '-');
   const containerName = `nanoclaw-${safeName}-${Date.now()}`;
   const containerArgs = buildContainerArgs(mounts, containerName);
@@ -638,11 +661,12 @@ export async function runContainerAgent(
 }
 
 export function writeTasksSnapshot(
-  groupFolder: string,
-  isMain: boolean,
+  userId: string,
+  isAdmin: boolean,
   tasks: Array<{
     id: string;
     groupFolder: string;
+    userId?: string;
     prompt: string;
     schedule_type: string;
     schedule_value: string;
@@ -650,14 +674,14 @@ export function writeTasksSnapshot(
     next_run: string | null;
   }>,
 ): void {
-  // Write filtered tasks to the group's IPC directory
-  const groupIpcDir = resolveGroupIpcPath(groupFolder);
+  // Write filtered tasks to the user's IPC directory
+  const groupIpcDir = resolveUserIpcPath(userId);
   fs.mkdirSync(groupIpcDir, { recursive: true });
 
-  // Main sees all tasks, others only see their own
-  const filteredTasks = isMain
+  // Admin sees all tasks, others only see their own
+  const filteredTasks = isAdmin
     ? tasks
-    : tasks.filter((t) => t.groupFolder === groupFolder);
+    : tasks.filter((t) => (t.userId || t.groupFolder) === userId);
 
   const tasksFile = path.join(groupIpcDir, 'current_tasks.json');
   fs.writeFileSync(tasksFile, JSON.stringify(filteredTasks, null, 2));
@@ -676,16 +700,16 @@ export interface AvailableGroup {
  * Non-main groups only see their own registration status.
  */
 export function writeGroupsSnapshot(
-  groupFolder: string,
-  isMain: boolean,
+  userId: string,
+  isAdmin: boolean,
   groups: AvailableGroup[],
   registeredJids: Set<string>,
 ): void {
-  const groupIpcDir = resolveGroupIpcPath(groupFolder);
+  const groupIpcDir = resolveUserIpcPath(userId);
   fs.mkdirSync(groupIpcDir, { recursive: true });
 
-  // Main sees all groups; others see nothing (they can't activate groups)
-  const visibleGroups = isMain ? groups : [];
+  // Admin sees all groups; others see nothing (they can't activate groups)
+  const visibleGroups = isAdmin ? groups : [];
 
   const groupsFile = path.join(groupIpcDir, 'available_groups.json');
   fs.writeFileSync(

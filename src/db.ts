@@ -2,14 +2,17 @@ import Database from 'better-sqlite3';
 import fs from 'fs';
 import path from 'path';
 
-import { ASSISTANT_NAME, DATA_DIR, STORE_DIR } from './config.js';
+import { ADMIN_USER_ID, ASSISTANT_NAME, DATA_DIR, STORE_DIR, USERS_DIR } from './config.js';
 import { isValidGroupFolder } from './group-folder.js';
+import { isValidUserId } from './user-folder.js';
 import { logger } from './logger.js';
 import {
   NewMessage,
   RegisteredGroup,
   ScheduledTask,
   TaskRunLog,
+  User,
+  UserChannel,
 } from './types.js';
 
 let db: Database.Database;
@@ -70,7 +73,7 @@ function createSchema(database: Database.Database): void {
       value TEXT NOT NULL
     );
     CREATE TABLE IF NOT EXISTS sessions (
-      group_folder TEXT PRIMARY KEY,
+      user_id TEXT PRIMARY KEY,
       session_id TEXT NOT NULL
     );
     CREATE TABLE IF NOT EXISTS registered_groups (
@@ -81,6 +84,23 @@ function createSchema(database: Database.Database): void {
       added_at TEXT NOT NULL,
       container_config TEXT,
       requires_trigger INTEGER DEFAULT 1
+    );
+
+    CREATE TABLE IF NOT EXISTS users (
+      id TEXT PRIMARY KEY,
+      display_name TEXT NOT NULL,
+      is_admin INTEGER DEFAULT 0,
+      container_config TEXT,
+      created_at TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS user_channels (
+      user_id TEXT NOT NULL,
+      jid TEXT NOT NULL UNIQUE,
+      channel TEXT NOT NULL,
+      added_at TEXT NOT NULL,
+      PRIMARY KEY (user_id, jid),
+      FOREIGN KEY (user_id) REFERENCES users(id)
     );
   `);
 
@@ -119,6 +139,28 @@ function createSchema(database: Database.Database): void {
     /* column already exists */
   }
 
+  // Add user_id column to scheduled_tasks
+  try {
+    database.exec(
+      `ALTER TABLE scheduled_tasks ADD COLUMN user_id TEXT`,
+    );
+    // Backfill: set user_id from group_folder for existing tasks
+    database.exec(
+      `UPDATE scheduled_tasks SET user_id = group_folder WHERE user_id IS NULL`,
+    );
+  } catch {
+    /* column already exists */
+  }
+
+  // Rename sessions.group_folder → sessions.user_id
+  try {
+    database.exec(
+      `ALTER TABLE sessions RENAME COLUMN group_folder TO user_id`,
+    );
+  } catch {
+    /* column already renamed or SQLite < 3.25 */
+  }
+
   // Add channel and is_group columns if they don't exist (migration for existing DBs)
   try {
     database.exec(`ALTER TABLE chats ADD COLUMN channel TEXT`);
@@ -150,6 +192,9 @@ export function initDatabase(): void {
 
   // Migrate from JSON files if they exist
   migrateJsonState();
+
+  // Auto-migrate registered_groups to users/user_channels
+  migrateGroupsToUsers();
 }
 
 /** @internal - for tests only. Creates a fresh in-memory database. */
@@ -513,26 +558,26 @@ export function setRouterState(key: string, value: string): void {
 
 // --- Session accessors ---
 
-export function getSession(groupFolder: string): string | undefined {
+export function getSession(userId: string): string | undefined {
   const row = db
-    .prepare('SELECT session_id FROM sessions WHERE group_folder = ?')
-    .get(groupFolder) as { session_id: string } | undefined;
+    .prepare('SELECT session_id FROM sessions WHERE user_id = ?')
+    .get(userId) as { session_id: string } | undefined;
   return row?.session_id;
 }
 
-export function setSession(groupFolder: string, sessionId: string): void {
+export function setSession(userId: string, sessionId: string): void {
   db.prepare(
-    'INSERT OR REPLACE INTO sessions (group_folder, session_id) VALUES (?, ?)',
-  ).run(groupFolder, sessionId);
+    'INSERT OR REPLACE INTO sessions (user_id, session_id) VALUES (?, ?)',
+  ).run(userId, sessionId);
 }
 
 export function getAllSessions(): Record<string, string> {
   const rows = db
-    .prepare('SELECT group_folder, session_id FROM sessions')
-    .all() as Array<{ group_folder: string; session_id: string }>;
+    .prepare('SELECT user_id, session_id FROM sessions')
+    .all() as Array<{ user_id: string; session_id: string }>;
   const result: Record<string, string> = {};
   for (const row of rows) {
-    result[row.group_folder] = row.session_id;
+    result[row.user_id] = row.session_id;
   }
   return result;
 }
@@ -632,6 +677,227 @@ export function getAllRegisteredGroups(): Record<string, RegisteredGroup> {
     };
   }
   return result;
+}
+
+// --- User entity accessors ---
+
+export function getUser(userId: string): User | undefined {
+  const row = db
+    .prepare('SELECT * FROM users WHERE id = ?')
+    .get(userId) as
+    | {
+        id: string;
+        display_name: string;
+        is_admin: number;
+        container_config: string | null;
+        created_at: string;
+      }
+    | undefined;
+  if (!row) return undefined;
+  return {
+    id: row.id,
+    display_name: row.display_name,
+    is_admin: row.is_admin === 1,
+    containerConfig: row.container_config
+      ? JSON.parse(row.container_config)
+      : undefined,
+    created_at: row.created_at,
+  };
+}
+
+export function getAllUsers(): Record<string, User> {
+  const rows = db.prepare('SELECT * FROM users').all() as Array<{
+    id: string;
+    display_name: string;
+    is_admin: number;
+    container_config: string | null;
+    created_at: string;
+  }>;
+  const result: Record<string, User> = {};
+  for (const row of rows) {
+    result[row.id] = {
+      id: row.id,
+      display_name: row.display_name,
+      is_admin: row.is_admin === 1,
+      containerConfig: row.container_config
+        ? JSON.parse(row.container_config)
+        : undefined,
+      created_at: row.created_at,
+    };
+  }
+  return result;
+}
+
+export function createUser(user: User): void {
+  if (!isValidUserId(user.id)) {
+    throw new Error(`Invalid user ID "${user.id}"`);
+  }
+  db.prepare(
+    `INSERT OR REPLACE INTO users (id, display_name, is_admin, container_config, created_at)
+     VALUES (?, ?, ?, ?, ?)`,
+  ).run(
+    user.id,
+    user.display_name,
+    user.is_admin ? 1 : 0,
+    user.containerConfig ? JSON.stringify(user.containerConfig) : null,
+    user.created_at,
+  );
+}
+
+export function getUserChannels(userId: string): UserChannel[] {
+  return db
+    .prepare('SELECT * FROM user_channels WHERE user_id = ?')
+    .all(userId) as UserChannel[];
+}
+
+export function getAllUserChannels(): UserChannel[] {
+  return db.prepare('SELECT * FROM user_channels').all() as UserChannel[];
+}
+
+export function addUserChannel(uc: UserChannel): void {
+  db.prepare(
+    `INSERT OR REPLACE INTO user_channels (user_id, jid, channel, added_at)
+     VALUES (?, ?, ?, ?)`,
+  ).run(uc.user_id, uc.jid, uc.channel, uc.added_at);
+}
+
+export function getUserByJid(jid: string): User | undefined {
+  const uc = db
+    .prepare('SELECT user_id FROM user_channels WHERE jid = ?')
+    .get(jid) as { user_id: string } | undefined;
+  if (!uc) return undefined;
+  return getUser(uc.user_id);
+}
+
+export function getTasksForUser(userId: string): ScheduledTask[] {
+  return db
+    .prepare(
+      `SELECT * FROM scheduled_tasks
+       WHERE user_id = ? OR group_folder = ?
+       ORDER BY created_at DESC`,
+    )
+    .all(userId, userId) as ScheduledTask[];
+}
+
+/**
+ * Get new messages across multiple JIDs (for multi-channel user routing).
+ */
+export function getNewMessagesMultiJid(
+  jids: string[],
+  sinceTimestamp: string,
+  botPrefix: string,
+  limit: number = 200,
+): NewMessage[] {
+  if (jids.length === 0) return [];
+
+  const placeholders = jids.map(() => '?').join(',');
+  const sql = `
+    SELECT * FROM (
+      SELECT id, chat_jid, sender, sender_name, content, timestamp, is_from_me
+      FROM messages
+      WHERE timestamp > ? AND chat_jid IN (${placeholders})
+        AND is_bot_message = 0 AND content NOT LIKE ?
+        AND content != '' AND content IS NOT NULL
+      ORDER BY timestamp DESC
+      LIMIT ?
+    ) ORDER BY timestamp
+  `;
+  return db
+    .prepare(sql)
+    .all(sinceTimestamp, ...jids, `${botPrefix}:%`, limit) as NewMessage[];
+}
+
+/**
+ * Auto-migrate registered_groups to users/user_channels.
+ * Safe to run multiple times — skips existing users.
+ */
+export function migrateGroupsToUsers(): void {
+  const groups = getAllRegisteredGroups();
+  if (Object.keys(groups).length === 0) return;
+
+  // Check if any users already exist (migration already done)
+  const userCount = (
+    db.prepare('SELECT COUNT(*) as count FROM users').get() as {
+      count: number;
+    }
+  ).count;
+  if (userCount > 0) return;
+
+  logger.info('Migrating registered_groups to users/user_channels');
+
+  const transaction = db.transaction(() => {
+    for (const [jid, group] of Object.entries(groups)) {
+      const userId = group.folder;
+      const isAdmin = group.isMain === true || userId === ADMIN_USER_ID;
+
+      // Create user
+      db.prepare(
+        `INSERT OR IGNORE INTO users (id, display_name, is_admin, container_config, created_at)
+         VALUES (?, ?, ?, ?, ?)`,
+      ).run(
+        userId,
+        group.name,
+        isAdmin ? 1 : 0,
+        group.containerConfig
+          ? JSON.stringify(group.containerConfig)
+          : null,
+        group.added_at,
+      );
+
+      // Detect channel from JID pattern
+      let channel = 'whatsapp';
+      if (jid.startsWith('tg:')) channel = 'telegram';
+      else if (jid.startsWith('dc:')) channel = 'discord';
+
+      // Create user_channel
+      db.prepare(
+        `INSERT OR IGNORE INTO user_channels (user_id, jid, channel, added_at)
+         VALUES (?, ?, ?, ?)`,
+      ).run(userId, jid, channel, group.added_at);
+
+      // Backfill user_id on scheduled_tasks
+      db.prepare(
+        `UPDATE scheduled_tasks SET user_id = ? WHERE group_folder = ? AND user_id IS NULL`,
+      ).run(userId, group.folder);
+
+      // Migrate sessions table (group_folder → user_id identity)
+      // Sessions key was group.folder, which is now user.id — no rename needed
+    }
+
+    // Copy group dirs to users/ and session/IPC dirs for migrated users
+    const groupsDir = path.join(USERS_DIR, '..', 'groups');
+    for (const group of Object.values(groups)) {
+      const userId = group.folder;
+
+      // Copy group folder → user folder
+      const oldDir = path.join(groupsDir, userId);
+      const newDir = path.join(USERS_DIR, userId);
+      if (fs.existsSync(oldDir) && !fs.existsSync(newDir)) {
+        try {
+          fs.cpSync(oldDir, newDir, { recursive: true });
+          logger.info(
+            { userId, from: oldDir, to: newDir },
+            'Copied group folder to user folder',
+          );
+        } catch (err) {
+          logger.warn(
+            { userId, err },
+            'Failed to copy group folder to user folder',
+          );
+        }
+      }
+
+      // Copy session dir (data/sessions/{folder}/ stays as-is since folder === userId)
+      // Copy IPC dir (data/ipc/{folder}/ stays as-is since folder === userId)
+      // No rename needed — the folder name IS the userId
+    }
+  });
+
+  transaction();
+  logger.info(
+    { userCount: Object.keys(groups).length },
+    'Migration complete: registered_groups → users/user_channels',
+  );
 }
 
 // --- JSON migration ---

@@ -3,12 +3,13 @@ import path from 'path';
 
 import { CronExpressionParser } from 'cron-parser';
 
-import { DATA_DIR, IPC_POLL_INTERVAL, TIMEZONE } from './config.js';
+import { ADMIN_USER_ID, DATA_DIR, IPC_POLL_INTERVAL, TIMEZONE } from './config.js';
 import { AvailableGroup } from './container-runner.js';
 import { createTask, deleteTask, getTaskById, updateTask } from './db.js';
 import { isValidGroupFolder } from './group-folder.js';
+import { isValidUserId } from './user-folder.js';
 import { logger } from './logger.js';
-import { RegisteredGroup } from './types.js';
+import { RegisteredGroup, User, UserChannel } from './types.js';
 
 export interface IpcDeps {
   sendMessage: (jid: string, text: string) => Promise<void>;
@@ -22,6 +23,8 @@ export interface IpcDeps {
     availableGroups: AvailableGroup[],
     registeredJids: Set<string>,
   ) => void;
+  createUser?: (user: User) => void;
+  addUserChannel?: (uc: UserChannel) => void;
 }
 
 let ipcWatcherRunning = false;
@@ -52,14 +55,15 @@ export function startIpcWatcher(deps: IpcDeps): void {
 
     const registeredGroups = deps.registeredGroups();
 
-    // Build folder→isMain lookup from registered groups
-    const folderIsMain = new Map<string, boolean>();
+    // Build folder→isAdmin lookup from registered groups + ADMIN_USER_ID
+    const folderIsAdmin = new Map<string, boolean>();
+    folderIsAdmin.set(ADMIN_USER_ID, true);
     for (const group of Object.values(registeredGroups)) {
-      if (group.isMain) folderIsMain.set(group.folder, true);
+      if (group.isMain) folderIsAdmin.set(group.folder, true);
     }
 
     for (const sourceGroup of groupFolders) {
-      const isMain = folderIsMain.get(sourceGroup) === true;
+      const isMain = folderIsAdmin.get(sourceGroup) === true;
       const messagesDir = path.join(ipcBaseDir, sourceGroup, 'messages');
       const tasksDir = path.join(ipcBaseDir, sourceGroup, 'tasks');
 
@@ -162,6 +166,7 @@ export async function processTaskIpc(
     schedule_value?: string;
     context_mode?: string;
     groupFolder?: string;
+    userId?: string;
     chatJid?: string;
     targetJid?: string;
     // For register_group
@@ -171,12 +176,20 @@ export async function processTaskIpc(
     trigger?: string;
     requiresTrigger?: boolean;
     containerConfig?: RegisteredGroup['containerConfig'];
+    // For create_user / add_user_channel
+    displayName?: string;
+    channel?: string;
   },
-  sourceGroup: string, // Verified identity from IPC directory
-  isMain: boolean, // Verified from directory path
+  sourceGroup: string, // Verified identity from IPC directory (userId or groupFolder)
+  isMain: boolean, // Verified from directory path (isAdmin)
   deps: IpcDeps,
 ): Promise<void> {
   const registeredGroups = deps.registeredGroups();
+
+  /** Check if sourceGroup owns a task (by user_id or group_folder). */
+  const ownsTask = (task: { user_id?: string; group_folder: string }) =>
+    isMain ||
+    (task.user_id || task.group_folder) === sourceGroup;
 
   switch (data.type) {
     case 'schedule_task':
@@ -276,7 +289,7 @@ export async function processTaskIpc(
     case 'pause_task':
       if (data.taskId) {
         const task = getTaskById(data.taskId);
-        if (task && (isMain || task.group_folder === sourceGroup)) {
+        if (task && ownsTask(task)) {
           updateTask(data.taskId, { status: 'paused' });
           logger.info(
             { taskId: data.taskId, sourceGroup },
@@ -294,7 +307,7 @@ export async function processTaskIpc(
     case 'resume_task':
       if (data.taskId) {
         const task = getTaskById(data.taskId);
-        if (task && (isMain || task.group_folder === sourceGroup)) {
+        if (task && ownsTask(task)) {
           updateTask(data.taskId, { status: 'active' });
           logger.info(
             { taskId: data.taskId, sourceGroup },
@@ -312,7 +325,7 @@ export async function processTaskIpc(
     case 'cancel_task':
       if (data.taskId) {
         const task = getTaskById(data.taskId);
-        if (task && (isMain || task.group_folder === sourceGroup)) {
+        if (task && ownsTask(task)) {
           deleteTask(data.taskId);
           logger.info(
             { taskId: data.taskId, sourceGroup },
@@ -337,7 +350,7 @@ export async function processTaskIpc(
           );
           break;
         }
-        if (!isMain && task.group_folder !== sourceGroup) {
+        if (!ownsTask(task)) {
           logger.warn(
             { taskId: data.taskId, sourceGroup },
             'Unauthorized task update attempt',
@@ -445,6 +458,74 @@ export async function processTaskIpc(
         logger.warn(
           { data },
           'Invalid register_group request - missing required fields',
+        );
+      }
+      break;
+
+    case 'create_user':
+      // Only admin can create users
+      if (!isMain) {
+        logger.warn(
+          { sourceGroup },
+          'Unauthorized create_user attempt blocked',
+        );
+        break;
+      }
+      if (data.userId && data.displayName) {
+        if (!isValidUserId(data.userId)) {
+          logger.warn(
+            { sourceGroup, userId: data.userId },
+            'Invalid create_user request - unsafe user ID',
+          );
+          break;
+        }
+        if (deps.createUser) {
+          deps.createUser({
+            id: data.userId,
+            display_name: data.displayName,
+            is_admin: false, // Defense in depth: agents cannot create admins
+            containerConfig: data.containerConfig,
+            created_at: new Date().toISOString(),
+          });
+          logger.info(
+            { userId: data.userId, sourceGroup },
+            'User created via IPC',
+          );
+        }
+      } else {
+        logger.warn(
+          { data },
+          'Invalid create_user request - missing required fields',
+        );
+      }
+      break;
+
+    case 'add_user_channel':
+      // Only admin can add channels to users
+      if (!isMain) {
+        logger.warn(
+          { sourceGroup },
+          'Unauthorized add_user_channel attempt blocked',
+        );
+        break;
+      }
+      if (data.userId && data.jid && data.channel) {
+        if (deps.addUserChannel) {
+          deps.addUserChannel({
+            user_id: data.userId,
+            jid: data.jid,
+            channel: data.channel,
+            added_at: new Date().toISOString(),
+          });
+          logger.info(
+            { userId: data.userId, jid: data.jid, channel: data.channel, sourceGroup },
+            'User channel added via IPC',
+          );
+        }
+      } else {
+        logger.warn(
+          { data },
+          'Invalid add_user_channel request - missing required fields',
         );
       }
       break;

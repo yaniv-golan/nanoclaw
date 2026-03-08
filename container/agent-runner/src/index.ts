@@ -23,8 +23,10 @@ interface ContainerInput {
   prompt: string;
   sessionId?: string;
   groupFolder: string;
+  userId?: string;
   chatJid: string;
   isMain: boolean;
+  isAdmin?: boolean;
   isScheduledTask?: boolean;
   assistantName?: string;
   secrets?: Record<string, string>;
@@ -391,10 +393,12 @@ async function runQuery(
   let messageCount = 0;
   let resultCount = 0;
 
+  const isAdmin = containerInput.isAdmin ?? containerInput.isMain;
+
   // Load global CLAUDE.md as additional system context (shared across all groups)
   const globalClaudeMdPath = '/workspace/global/CLAUDE.md';
   let globalClaudeMd: string | undefined;
-  if (!containerInput.isMain && fs.existsSync(globalClaudeMdPath)) {
+  if (!isAdmin && fs.existsSync(globalClaudeMdPath)) {
     globalClaudeMd = fs.readFileSync(globalClaudeMdPath, 'utf-8');
   }
 
@@ -444,8 +448,8 @@ async function runQuery(
           args: [mcpServerPath],
           env: {
             NANOCLAW_CHAT_JID: containerInput.chatJid,
-            NANOCLAW_GROUP_FOLDER: containerInput.groupFolder,
-            NANOCLAW_IS_MAIN: containerInput.isMain ? '1' : '0',
+            NANOCLAW_GROUP_FOLDER: containerInput.userId || containerInput.groupFolder,
+            NANOCLAW_IS_MAIN: (containerInput.isAdmin ?? containerInput.isMain) ? '1' : '0',
           },
         },
       },
@@ -498,7 +502,7 @@ async function main(): Promise<void> {
     containerInput = JSON.parse(stdinData);
     // Delete the temp file the entrypoint wrote — it contains secrets
     try { fs.unlinkSync('/tmp/input.json'); } catch { /* may not exist */ }
-    log(`Received input for group: ${containerInput.groupFolder}`);
+    log(`Received input for user: ${containerInput.userId || containerInput.groupFolder}`);
   } catch (err) {
     writeOutput({
       status: 'error',

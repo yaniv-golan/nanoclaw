@@ -2,7 +2,7 @@ import { ChildProcess } from 'child_process';
 import { CronExpressionParser } from 'cron-parser';
 import fs from 'fs';
 
-import { ASSISTANT_NAME, SCHEDULER_POLL_INTERVAL, TIMEZONE } from './config.js';
+import { ADMIN_USER_ID, ASSISTANT_NAME, SCHEDULER_POLL_INTERVAL, TIMEZONE } from './config.js';
 import {
   ContainerOutput,
   runContainerAgent,
@@ -17,9 +17,14 @@ import {
   updateTaskAfterRun,
 } from './db.js';
 import { GroupQueue } from './group-queue.js';
-import { resolveGroupFolderPath } from './group-folder.js';
+import { resolveUserFolderPath } from './user-folder.js';
 import { logger } from './logger.js';
 import { RegisteredGroup, ScheduledTask } from './types.js';
+
+/** Resolve the effective user/folder ID for a task. */
+function taskUserId(task: ScheduledTask): string {
+  return task.user_id || task.group_folder;
+}
 
 /**
  * Compute the next run time for a recurring task, anchored to the
@@ -80,16 +85,17 @@ async function runTask(
   deps: SchedulerDependencies,
 ): Promise<void> {
   const startTime = Date.now();
+  const userId = taskUserId(task);
   let groupDir: string;
   try {
-    groupDir = resolveGroupFolderPath(task.group_folder);
+    groupDir = resolveUserFolderPath(userId);
   } catch (err) {
     const error = err instanceof Error ? err.message : String(err);
     // Stop retry churn for malformed legacy rows.
     updateTask(task.id, { status: 'paused' });
     logger.error(
-      { taskId: task.id, groupFolder: task.group_folder, error },
-      'Task has invalid group folder',
+      { taskId: task.id, userId, error },
+      'Task has invalid user/group folder',
     );
     logTaskRun({
       task_id: task.id,
@@ -104,18 +110,18 @@ async function runTask(
   fs.mkdirSync(groupDir, { recursive: true });
 
   logger.info(
-    { taskId: task.id, group: task.group_folder },
+    { taskId: task.id, userId },
     'Running scheduled task',
   );
 
   const groups = deps.registeredGroups();
   const group = Object.values(groups).find(
-    (g) => g.folder === task.group_folder,
+    (g) => g.folder === userId,
   );
 
   if (!group) {
     logger.error(
-      { taskId: task.id, groupFolder: task.group_folder },
+      { taskId: task.id, userId },
       'Group not found for task',
     );
     logTaskRun({
@@ -124,20 +130,21 @@ async function runTask(
       duration_ms: Date.now() - startTime,
       status: 'error',
       result: null,
-      error: `Group not found: ${task.group_folder}`,
+      error: `Group not found: ${userId}`,
     });
     return;
   }
 
-  // Update tasks snapshot for container to read (filtered by group)
-  const isMain = group.isMain === true;
+  // Update tasks snapshot for container to read (filtered by user)
+  const isAdmin = group.isMain === true || userId === ADMIN_USER_ID;
   const tasks = getAllTasks();
   writeTasksSnapshot(
-    task.group_folder,
-    isMain,
+    userId,
+    isAdmin,
     tasks.map((t) => ({
       id: t.id,
       groupFolder: t.group_folder,
+      userId: t.user_id,
       prompt: t.prompt,
       schedule_type: t.schedule_type,
       schedule_value: t.schedule_value,
@@ -149,10 +156,10 @@ async function runTask(
   let result: string | null = null;
   let error: string | null = null;
 
-  // For group context mode, use the group's current session
+  // For group context mode, use the user's current session
   const sessions = deps.getSessions();
   const sessionId =
-    task.context_mode === 'group' ? sessions[task.group_folder] : undefined;
+    task.context_mode === 'group' ? sessions[userId] : undefined;
 
   // After the task produces a result, close the container promptly.
   // Tasks are single-turn — no need to wait IDLE_TIMEOUT (30 min) for the
@@ -164,7 +171,7 @@ async function runTask(
     if (closeTimer) return; // already scheduled
     closeTimer = setTimeout(() => {
       logger.debug({ taskId: task.id }, 'Closing task container after result');
-      deps.queue.closeStdin(task.chat_jid);
+      deps.queue.closeStdin(userId);
     }, TASK_CLOSE_DELAY_MS);
   };
 
@@ -174,14 +181,16 @@ async function runTask(
       {
         prompt: task.prompt,
         sessionId,
-        groupFolder: task.group_folder,
+        groupFolder: userId,
+        userId,
         chatJid: task.chat_jid,
-        isMain,
+        isMain: isAdmin,
+        isAdmin,
         isScheduledTask: true,
         assistantName: ASSISTANT_NAME,
       },
       (proc, containerName) =>
-        deps.onProcess(task.chat_jid, proc, containerName, task.group_folder),
+        deps.onProcess(userId, proc, containerName, userId),
       async (streamedOutput: ContainerOutput) => {
         if (streamedOutput.result) {
           result = streamedOutput.result;
@@ -190,7 +199,7 @@ async function runTask(
           scheduleClose();
         }
         if (streamedOutput.status === 'success') {
-          deps.queue.notifyIdle(task.chat_jid);
+          deps.queue.notifyIdle(userId);
         }
         if (streamedOutput.status === 'error') {
           error = streamedOutput.error || 'Unknown error';
@@ -261,7 +270,7 @@ export function startSchedulerLoop(deps: SchedulerDependencies): void {
           continue;
         }
 
-        deps.queue.enqueueTask(currentTask.chat_jid, currentTask.id, () =>
+        deps.queue.enqueueTask(taskUserId(currentTask), currentTask.id, () =>
           runTask(currentTask, deps),
         );
       }
